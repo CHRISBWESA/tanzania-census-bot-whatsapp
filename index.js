@@ -1,8 +1,9 @@
-// index.js - Main entry point for the WhatsApp chatbot
+/**
+ * index.js - Main entry point for the WhatsApp chatbot
+ */
 
 // Import required modules
-import makeWASocket from '@whiskeysockets/baileys'; // Baileys library for WhatsApp connection
-import { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys'; // Utilities for auth and disconnection
+import makeWASocket, { DisconnectReason, useMultiFileAuthState } from '@whiskeysockets/baileys'; // Baileys library for WhatsApp
 import { Boom } from '@hapi/boom'; // For handling errors
 import pino from 'pino'; // Logger
 import fs from 'fs'; // File system for reading JSON and saving QR code
@@ -23,16 +24,21 @@ let censusData;
 try {
   const rawData = fs.readFileSync(censusDataPath, 'utf-8');
   censusData = JSON.parse(rawData).tanzania_census_2022;
+  if (!censusData || !Array.isArray(censusData.regions)) {
+    throw new Error('Invalid census data structure: regions missing or not an array');
+  }
   console.log('Census data loaded, regions:', censusData.regions.length);
 } catch (err) {
   console.error('Failed to load census.json:', err.message);
   process.exit(1);
 }
 
-// Function to connect to WhatsApp
+/**
+ * Connects to WhatsApp and sets up event handlers.
+ * @returns {Promise<Object>} Baileys socket instance
+ */
 const connectToWhatsApp = async () => {
   console.log('Attempting to connect to WhatsApp...');
-  // Use multi-file auth state to save session
   try {
     const { state, saveCreds } = await useMultiFileAuthState('auth_info');
 
@@ -48,19 +54,19 @@ const connectToWhatsApp = async () => {
     // Save credentials whenever updated
     sock.ev.on('creds.update', saveCreds);
 
+    // Track user message timestamps for rate-limiting
+    const userLastMessage = new Map();
+
     // Handle connection updates for reconnection logic
     sock.ev.on('connection.update', async (update) => {
-      const { connection, lastDisconnect, qr } = update;
+      const { connection, lastDisconnect, qr, isNewLogin } = update;
       if (qr) {
         console.log('QR Code generated (scan within 90 seconds):', qr);
         console.log('Generating graphical QR code image...');
         try {
           const qrFilePath = path.join(__dirname, 'qr.png');
           await QRCode.toFile(qrFilePath, qr, {
-            color: {
-              dark: '#000000', // Black QR code
-              light: '#FFFFFF' // White background
-            }
+            color: { dark: '#000000', light: '#FFFFFF' }
           });
           console.log(`Graphical QR code saved as ${qrFilePath}`);
           console.log('1. Open WhatsApp: Settings > Linked Devices > Link a Device.');
@@ -69,6 +75,9 @@ const connectToWhatsApp = async () => {
         } catch (err) {
           console.error('Failed to generate QR code image:', err.message);
         }
+      } else if (isNewLogin && !qr) {
+        console.log('QR code expired or no longer needed.');
+        await sock.sendMessage('YOUR_TEST_NUMBER@.us', { text: 'QR code expired. Please restart the bot to generate a new one.' });
       }
       if (connection === 'close') {
         const shouldReconnect = (lastDisconnect?.error)?.output?.statusCode !== DisconnectReason.loggedOut;
@@ -81,9 +90,19 @@ const connectToWhatsApp = async () => {
       }
     });
 
-    // Handle incoming messages
+    // Handle incoming messages with rate-limiting
     sock.ev.on('messages.upsert', async (m) => {
       const msg = m.messages[0];
+      const from = msg.key.remoteJid;
+      const now = Date.now();
+      const lastMessageTime = userLastMessage.get(from) || 0;
+
+      if (now - lastMessageTime < 1000) { // 1-second cooldown
+        console.log(`Rate-limiting user ${from}: message ignored`);
+        return;
+      }
+      userLastMessage.set(from, now);
+
       console.log('Received message:', JSON.stringify(msg, null, 2));
       if (!msg.key.fromMe && m.type === 'notify') { // Only process user messages
         await handleMessage(sock, msg, censusData);
@@ -100,5 +119,5 @@ const connectToWhatsApp = async () => {
 // Start the connection
 connectToWhatsApp().catch(err => console.error('Connection failed:', err));
 
-// Export for modularity if needed (though not required here)
+// Export for modularity if needed
 export { connectToWhatsApp };
